@@ -1,0 +1,246 @@
+AWSTemplateFormatVersion: '2010-09-09'
+################################################################################
+#
+#
+# DESCRIPTION
+#
+##############################################################################
+################################################################################
+#
+#
+# RESOURCES
+#
+##############################################################################
+Resources:
+  rECRRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: hello-server
+  rECRRepoParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: ECR Repository
+      Name: ecr-repo-name
+      Type: String
+      Value: !Ref rECRRepo
+  rECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/hello-server
+  rTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Name: hello-server
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/hello-server
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 80
+              Protocol: tcp
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/hello-server
+              awslogs-region: eu-west-1
+              awslogs-stream-prefix: ecs
+      Family: hello-server
+      NetworkMode: bridge
+      Memory: 256
+      RequiresCompatibilities:
+        - EC2
+  rTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: hello-server-tg
+      TargetType: instance
+      HealthCheckIntervalSeconds: 5
+      HealthCheckPath: /ping
+      HealthCheckTimeoutSeconds: 3
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Sub '{{resolve:ssm:vpc}}'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '5'
+  rListenerRule:
+    Type: 'AWS::ElasticLoadBalancingV2::ListenerRule'
+    Properties:
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref rTargetGroup
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - "/hello/*"
+      ListenerArn: !Sub '{{resolve:ssm:public-lb-listener}}'
+      Priority: 10
+  rCodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /codebuild/hello-server
+  rS3ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub ${AWS::AccountId}-artifacts-bucket
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+  rCodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+                - codebuild.amazonaws.com
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Description: Permission to execute AWS CodePipeline
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+      Policies:
+        - PolicyName: pipeline-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowS3Actions
+                Effect: 'Allow'
+                Action:
+                  - 'codecommit:UploadArchive'
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${rS3ArtifactBucket}'
+                  - !Sub 'arn:aws:s3:::${rS3ArtifactBucket}/*'
+              - Sid: AllowCodeBuildActions
+                Effect: 'Allow'
+                Action:
+                  - 'codebuild:StartBuild'
+                  - 'codebuild:BatchGetBuilds'
+                Resource:
+                  - '*'
+              - Sid: AllowCodeDeployActions
+                Effect: 'Allow'
+                Action:
+                  - 'ecs:*'
+                Resource:
+                  - '*'
+              - Sid: AllowCWLogsActions
+                Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:CreateLogGroup'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:codebuild/hello-server:log-stream:*'
+  rCodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: true
+      Name: hello-server-build
+      ServiceRole: !GetAtt rCodePipelineServiceRole.Arn
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: codebuild/hello-server
+          Status : ENABLED
+      Source:
+        Type: CODEPIPELINE
+
+  rCodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Location: !Ref rS3ArtifactBucket
+        Type: S3
+      Name: hello-server-pipeline
+      RoleArn: !GetAtt rCodePipelineServiceRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              Configuration:
+                Owner: tsepiie25
+                Repo: git@github.com:tsepiie25/WeShare.git
+                Branch: main
+                OAuthToken: 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
+              Name: SourceAction
+              OutputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+
+        - Name: Build
+          Actions:
+            - ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref rCodeBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              Name: BuildAction
+              OutputArtifacts:
+                - Name: BuildOutput
+        - Name: Deploy
+          Actions:
+            - ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: ECS
+              Configuration:
+                ClusterName: !Sub '{{resolve:ssm:ecs-cluster-name}}'
+                ServiceName: hello-server
+              Name: DeployAction
+              InputArtifacts:
+                - Name: BuildOutput
+
+  rECSService:
+    Type: 'AWS::ECS::Service'
+    Properties:
+      ServiceName: hello-server
+      Cluster: !Sub '{{resolve:ssm:ecs-cluster-arn}}'
+      DesiredCount: 2
+      LaunchType: EC2
+      LoadBalancers:
+        - ContainerName: hello-server
+          ContainerPort: 80
+          TargetGroupArn: !Ref rTargetGroup
+      SchedulingStrategy: REPLICA
+      HealthCheckGracePeriodSeconds: 8
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+      TaskDefinition: !Ref rTaskDefinition
+
+
+###############################################################################
+#
+#
+# OUTPUTS
+#
+###############################################################################
+Outputs:
+  ECSTaskDefinition:
+    Description: The created Taskdefinition.
+    Value: !Ref rTaskDefinition
